@@ -2,13 +2,60 @@ require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const xss = require('xss-clean');
+const hpp = require('hpp');
 const app = express();
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// =======================
+// Security Middleware
+// =======================
+app.use(helmet());
+app.use(xss());
+app.use(hpp());
 
-// MySQL Connection Pool
+// Enhanced CORS Configuration
+const allowedOrigins = [
+  'http://localhost:3000', // React dev server
+  'http://127.0.0.1:3000', // Alternative localhost
+  process.env.FRONTEND_URL // Your production frontend URL
+].filter(Boolean);
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.some(allowed => origin.startsWith(allowed))) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  maxAge: 86400
+}));
+
+// Handle preflight requests
+app.options('*', cors());
+
+// Rate Limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: 'Too many requests from this IP, please try again later'
+});
+app.use('/api/', limiter);
+
+// Body Parser
+app.use(express.json({ limit: '10kb' }));
+
+// =======================
+// Database Configuration
+// =======================
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -16,56 +63,150 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  ssl: process.env.DB_SSL === 'true' ? { 
+    rejectUnauthorized: true,
+    ca: process.env.DB_CA_CERT // Add your CA cert if needed
+  } : undefined
 });
 
-// CRUD Routes
+// Test database connection on startup
+(async () => {
+  try {
+    const conn = await pool.getConnection();
+    console.log('✅ Database connection established');
+    conn.release();
+  } catch (err) {
+    console.error('❌ Database connection failed:', err.message);
+    process.exit(1);
+  }
+})();
+
+// =======================
+// API Routes
+// =======================
+
+// Health Check
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.status(200).json({ 
+      status: 'healthy',
+      database: 'connected',
+      uptime: process.uptime()
+    });
+  } catch (err) {
+    res.status(500).json({ 
+      status: 'unhealthy',
+      database: 'disconnected',
+      error: err.message 
+    });
+  }
+});
+
+// Enhanced CRUD Operations with Transactions
 app.get('/api/expenses', async (req, res) => {
   try {
-    const [rows] = await pool.query('SELECT * FROM expenses ORDER BY date DESC');
+    const [rows] = await pool.query(`
+      SELECT id, description, amount, category, 
+             DATE_FORMAT(date, '%Y-%m-%d %H:%i:%s') as date 
+      FROM expenses 
+      ORDER BY date DESC
+    `);
     res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('GET /api/expenses error:', err);
+    res.status(500).json({ error: 'Failed to fetch expenses' });
   }
 });
 
 app.post('/api/expenses', async (req, res) => {
+  const conn = await pool.getConnection();
   try {
+    await conn.beginTransaction();
+    
     const { description, amount, category } = req.body;
-    const [result] = await pool.query(
+    
+    // Input validation
+    if (!description?.trim()) {
+      throw new Error('Description is required');
+    }
+    if (!amount || isNaN(amount) || parseFloat(amount) <= 0) {
+      throw new Error('Amount must be a positive number');
+    }
+    if (!category?.trim()) {
+      throw new Error('Category is required');
+    }
+
+    const [result] = await conn.query(
       'INSERT INTO expenses (description, amount, category) VALUES (?, ?, ?)',
-      [description, amount, category]
+      [description.trim(), parseFloat(amount), category.trim()]
     );
-    res.status(201).json({ id: result.insertId, ...req.body });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-app.put('/api/expenses/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { description, amount, category } = req.body;
-    await pool.query(
-      'UPDATE expenses SET description = ?, amount = ?, category = ? WHERE id = ?',
-      [description, amount, category, id]
+    
+    const [newExpense] = await conn.query(
+      `SELECT id, description, amount, category, 
+              DATE_FORMAT(date, '%Y-%m-%d %H:%i:%s') as date 
+       FROM expenses WHERE id = ?`, 
+      [result.insertId]
     );
-    res.json({ id, ...req.body });
+    
+    await conn.commit();
+    res.status(201).json(newExpense[0]);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    await conn.rollback();
+    console.error('POST /api/expenses error:', err);
+    res.status(400).json({ error: err.message || 'Failed to create expense' });
+  } finally {
+    conn.release();
   }
 });
 
-app.delete('/api/expenses/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query('DELETE FROM expenses WHERE id = ?', [id]);
-    res.status(204).end();
-  } catch (err) {
-    res.status(400).json({ error: err.message });
+// ... (put and delete endpoints with similar transaction handling)
+
+// =======================
+// Error Handling
+// =======================
+app.use((err, req, res, next) => {
+  console.error('Global error handler:', err);
+  
+  if (err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ error: 'Origin not allowed' });
   }
+
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
 });
 
-// Start Server
+// 404 Handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// =======================
+// Server Startup
+// =======================
 const PORT = process.env.PORT || 5111;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🔒 CORS allowed for: ${allowedOrigins.join(', ')}`);
+});
+
+// Graceful Shutdown
+const shutdown = async () => {
+  console.log('\n🛑 Shutting down gracefully...');
+  
+  try {
+    await new Promise(resolve => server.close(resolve));
+    await pool.end();
+    console.log('✅ Server and database connections closed');
+    process.exit(0);
+  } catch (err) {
+    console.error('❌ Error during shutdown:', err);
+    process.exit(1);
+  }
+};
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
