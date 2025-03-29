@@ -1,53 +1,71 @@
-// backend/server.js
-const express = require('express');
-const mysql = require('mysql2');
-const cors = require('cors');
 require('dotenv').config();
-
+const express = require('express');
+const mysql = require('mysql2/promise');
+const cors = require('cors');
 const app = express();
-const port = 5000;
 
-app.use(express.json());
+// Middleware
 app.use(cors());
+app.use(express.json());
 
-const db = mysql.createConnection({
+// MySQL Connection Pool
+const pool = mysql.createPool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 });
 
-db.connect((err) => {
-  if (err) {
-    console.error('Could not connect to MySQL:', err);
-    return;
+// CRUD Routes
+app.get('/api/expenses', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM expenses ORDER BY date DESC');
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  console.log('Connected to MySQL');
 });
 
-app.post('/api/expenses', (req, res) => {
-  const { title, amount, date } = req.body;
-  const query = 'INSERT INTO expenses (title, amount, date) VALUES (?, ?, ?)';
-  db.query(query, [title, amount, date], (err, result) => {
-    if (err) {
-      console.error('Error adding expense:', err);
-      return res.status(500).json({ error: 'Failed to add expense' });
-    }
-    res.status(201).json({ id: result.insertId, title, amount, date });
-  });
+app.post('/api/expenses', async (req, res) => {
+  try {
+    const { description, amount, category } = req.body;
+    const [result] = await pool.query(
+      'INSERT INTO expenses (description, amount, category) VALUES (?, ?, ?)',
+      [description, amount, category]
+    );
+    res.status(201).json({ id: result.insertId, ...req.body });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-app.get('/api/expenses', (req, res) => {
-  const query = 'SELECT * FROM expenses';
-  db.query(query, (err, results) => {
-    if (err) {
-      console.error('Error fetching expenses:', err);
-      return res.status(500).json({ error: 'Failed to fetch expenses' });
-    }
-    res.status(200).json(results);
-  });
+app.put('/api/expenses/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { description, amount, category } = req.body;
+    await pool.query(
+      'UPDATE expenses SET description = ?, amount = ?, category = ? WHERE id = ?',
+      [description, amount, category, id]
+    );
+    res.json({ id, ...req.body });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+app.delete('/api/expenses/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM expenses WHERE id = ?', [id]);
+    res.status(204).end();
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
+
+// Start Server
+const PORT = process.env.PORT || 5111;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
